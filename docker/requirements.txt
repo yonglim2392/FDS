@@ -1,0 +1,22 @@
+# Data Engineering & Messaging
+kafka-python>=2.0.2
+pyspark>=3.5.0
+redis>=5.0.0
+psycopg2-binary>=2.9.9
+SQLAlchemy>=2.0.29
+
+# Machine Learning & Data Processing
+pandas>=2.2.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+joblib>=1.4.0
+
+# Orchestration
+apache-airflow>=2.9.0
+
+# Dashboard & Visualization
+streamlit>=1.34.0
+plotly>=5.20.0
+
+# Mock Data Generation
+Faker>=25.0.0
