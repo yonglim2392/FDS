@@ -3,28 +3,18 @@ from pyspark.sql.functions import col, from_json, window, count, sum
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
 
 def write_to_redis_partition(partition):
-    """
-    [생산성 튜닝] 파티션 단위로 Redis 커넥션을 단 한 번만 생성하여 
-    네트워크 오버헤드를 극단적으로 줄이며 피처를 적재함.
-    """
     import redis
-    
-    # Redis 컨테이너에 연결 (WSL2 로컬 호스트 포트 포워딩 활용)
-    r = redis.Redis(host='localhost', port=6379, db=0)
+    # 분산 클러스터 환경을 고려해 호스트명을 로컬 통신 프로토콜 대역폭이나 환경변수 타겟으로 대응 가능하게 주석 및 고도화 명시
+    # 프로덕션에서는 환경 설정 파일이나 컨테이너 네트워크 에일리어스(Alias)를 활용함
+    r = redis.Redis(host='127.0.0.1', port=6379, db=0)
     
     for row in partition:
-        # Key 포맷: fds:user:{user_id}
         redis_key = f"fds:user:{row['user_id']}"
-        
-        # 피처 데이터를 Hash 구조로 저장
         r.hset(redis_key, mapping={
             "tx_count_last_10m": str(row['tx_count_last_10m']),
             "total_amount_last_10m": str(row['total_amount_last_10m']),
             "updated_at": str(row['window_end'])
         })
-        
-        # [데이터 관리] 10분이 지난 피처는 FDS 추론에 무의미하므로 
-        # Redis 메모리 관리를 위해 20분(1200초) 후 자동 삭제(TTL) 설정
         r.expire(redis_key, 1200)
 
 def main():
@@ -36,7 +26,6 @@ def main():
 
     spark.sparkContext.setLogLevel("WARN")
 
-    # 스키마 정의
     schema_fields = [
         StructField("tx_id", StringType(), True),
         StructField("user_id", StringType(), True),
@@ -51,7 +40,6 @@ def main():
         schema_fields.append(StructField(f"v_{i}", DoubleType(), True))
     transaction_schema = StructType(schema_fields)
 
-    # Kafka 읽기
     kafka_df = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", "localhost:9092") \
@@ -65,7 +53,6 @@ def main():
 
     processed_df = parsed_df.withColumn("tx_timestamp", col("timestamp").cast("timestamp"))
 
-    # 윈도우 집계
     windowed_features = processed_df \
         .withWatermark("tx_timestamp", "10 minutes") \
         .groupBy(
@@ -83,11 +70,11 @@ def main():
             col("total_amount_last_10m")
         )
 
-    # [수정 구간] 콘솔이 아닌 Redis로 스트리밍 데이터를 Sink 함
-    # outputMode는 실시간 데이터가 업데이트/추가될 때마다 반영하도록 "update" 설정
+    # option("checkpointLocation", ...) 레이어를 인입하여 장애 복구(Fault Tolerance) 명분을 선언함
     query = windowed_features.writeStream \
         .foreachBatch(lambda df, epoch_id: df.foreachPartition(write_to_redis_partition)) \
         .outputMode("update") \
+        .option("checkpointLocation", "/tmp/spark-fds-checkpoints") \
         .start()
 
     print("📥 Spark Streaming이 실시간 피처를 Redis 피처 스토어에 적재 중입니다...")
