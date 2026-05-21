@@ -1,5 +1,3 @@
-# README.md
-
 # 🛡️ Real-Time Fraud Detection System (Lambda Architecture FDS)
 
 > Distributed Real-Time Fraud Detection Platform with Streaming Feature Engineering, Online Feature Store, Fault-Tolerant Stream Processing, and Low-Latency ML Inference Architecture
@@ -25,131 +23,97 @@
 
 ---
 
-# 🚀 Core Engineering Challenges & Architecture Decisions
+## 🚀 Core Engineering Challenges & Architecture Decisions
 
-## 1. Low-Latency Online Feature Store Architecture
+### 1. Low-Latency Online Feature Store Architecture
 
-### Problem
+#### **Problem** 
+* 실시간 결제 승인 시점마다 '최근 10분간의 실시간 거래 빈도'와 '최근 30일간의 평균 결제 행동 패턴'을 조합해야 했습니다. 이를 매 요청마다 RDB Join으로 처리할 경우 디스크 I/O 병목 및 네트워크 RTT 증가로 인해 실시간 승인 SLA(50ms)를 만족할 수 없었습니다.
 
-실시간 결제 승인 시점마다 다음 정보를 조합해야 했다.
+#### **Solution** 
+* 람다 아키텍처 기반으로 연산 레이어를 분리했습니다.
+  - `Spark Structured Streaming` → 실시간 10분 윈도우 집계
+  - `Airflow Batch Job` → 30일 행동 프로필 계산
+  - `Redis` → Unified Online Feature Store
 
-- 최근 10분간의 실시간 거래 빈도
-- 최근 30일간의 평균 결제 행동 패턴
-- 디바이스·가맹점 기반 위험 프로필
-
-이를 매 요청마다 RDB Join으로 처리할 경우 디스크 I/O 병목 및 네트워크 RTT 증가로 인해 실시간 승인 SLA를 만족할 수 없었다.
-
-### Solution
-
-람다 아키텍처 기반으로 Batch Layer와 Streaming Layer를 분리하였다.
-
-- Spark Structured Streaming → 실시간 10분 윈도우 집계
-- Airflow Batch Job → 30일 행동 프로필 계산
-- Redis → Unified Online Feature Store
-
-최종적으로 추론 엔진은 Redis에서 모든 피처를 O(1)에 조회하며, 실시간 승인 요청당 평균 1ms 미만의 Feature Retrieval Latency를 달성하였다.
+#### **Impact** 
+* 최종적으로 추론 엔진은 Redis에서 모든 다차원 피처를 $O(1)$ 레이턴시에 조회하며, 실시간 승인 요청당 평균 **1ms 미만(0.793ms)의 Feature Retrieval Latency**를 달성했습니다.
 
 ---
 
 ## 2. Disk I/O Isolation with Producer-Consumer Pattern
 
-### Problem
+#### **Problem** 
+* 실시간 추론 이후 원천 로그 및 추론 결과를 PostgreSQL에 저장해야 했으나, 동기식 DB Write 구조에서는 다음 문제가 발생했다.
+  - Kafka Consumer Lag 증가
+  - DB Connection Pool 고갈
+  - Disk Flush Wait
+  - End-to-End Latency 폭증
 
-실시간 추론 이후 원천 로그 및 추론 결과를 PostgreSQL에 저장해야 했으나, 동기식 DB Write 구조에서는 다음 문제가 발생했다.
-
-- Kafka Consumer Lag 증가
-- DB Connection Pool 고갈
-- Disk Flush Wait
-- End-to-End Latency 폭증
-
-### Solution
-
-Inference Engine 내부에 다음 구조를 도입하였다.
-
-- Bounded In-Memory Queue
-- Background Daemon Worker
-- Producer-Consumer Async Pipeline
-
-실시간 추론 루프는 메모리 큐에 즉시 Enqueue 후 다음 메시지를 처리하며, 별도 백그라운드 워커가 비동기적으로 PostgreSQL에 적재한다.
-
-이를 통해 Disk I/O가 메인 추론 경로에 영향을 주지 않는 완전한 I/O Decoupling 구조를 구현하였다.
+#### **Solution** 
+* Inference Engine 내부에 다음 구조를 도입하였다.
+  - `Bounded In-Memory Queue`
+  - `Background Daemon Worker`
+  - Producer-Consumer Async Pipeline
+    
+#### **Impact** 
+* 실시간 추론 루프는 메모리 큐에 즉시 결과를 Enqueue한 뒤 다음 카프카 메시지를 처리하며, 별도의 백그라운드 워커가 비동기적으로 DB에 적재합니다.
+* 이를 통해 무거운 Disk I/O가 메인 추론 경로(Critical Path)에 미치는 영향을 0%로 통제하는 완전한 I/O Decoupling 구조를 완성했습니다.
 
 ---
 
 ## 3. OOM Prevention & Idempotent Batch Reprocessing
 
-### Problem
+#### **Problem** 
+* 수천만 건 규모의 장기 거래 로그 집계 시 전체 로딩(`fetchall()`) 구조는 메모리 고갈(OOM)을 유발하였다.
+* 또한 NOW() 기반 비결정성 쿼리는 Backfill/Reprocessing 시 데이터 정합성을 깨뜨리는 문제가 있었다.
 
-수천만 건 규모의 장기 거래 로그 집계 시 전체 로딩(fetchall()) 구조는 메모리 고갈(OOM)을 유발하였다.
+#### **Solution** 
+* Memory-Safe Batch Aggregation
+  - PostgreSQL `Server-side Cursor`
+  - `fetchmany(5000)` Chunk Streaming
 
-또한 NOW() 기반 비결정성 쿼리는 Backfill/Reprocessing 시 데이터 정합성을 깨뜨리는 문제가 있었다.
+* Idempotency
+  - Airflow `execution_date`(`{{ ds }}`) 기반 논리적 시간 파라미터를 쿼리에 주입하였다.
 
-### Solution
-
-#### Memory-Safe Batch Aggregation
-
-- PostgreSQL Server-side Cursor
-- fetchmany(5000) Chunk Streaming
-
-을 적용하여 메모리 사용량을 상한선 내로 제한하였다.
-
-#### Fully Idempotent Batch Design
-
-Airflow execution_date 기반 논리적 시간 파라미터를 쿼리에 주입하였다.
-
-```sql
-WHERE transaction_date < {{ ds }}
-```
-
-이를 통해 언제 재실행하더라도 동일한 결과를 보장하는 완전한 멱등성을 확보하였다.
+    ```sql
+    WHERE transaction_date < {{ ds }}
+    ```
 
 ---
 
 ## 4. Fault-Tolerant Distributed Streaming
 
-### Problem
+#### **Problem** 
+* 분산 스트리밍 노드 장애 발생 시 다음 문제가 존재했다.
+  - Window Aggregation State Loss
+  - Duplicate Processing
+  - Streaming Recovery Failure
+* 또한 Redis Connection을 Row 단위로 생성할 경우 네트워크 오버헤드로 처리량이 급격히 감소하였다.
 
-분산 스트리밍 노드 장애 발생 시 다음 문제가 존재했다.
+#### **Solution** 
+* Fault Tolerance
+  - park Structured Streaming에 `.option("checkpointLocation", "...")` 기반 상태 영속화를 적용하여 노드 크래시 발생 시에도 Exactly-Once 수준의 스트리밍 상태 자가 복원력을 확보했습니다.
+    ```python
+    .option("checkpointLocation", "/tmp/fds-checkpoint")
+    ```
 
-- Window Aggregation State Loss
-- Duplicate Processing
-- Streaming Recovery Failure
-
-또한 Redis Connection을 Row 단위로 생성할 경우 네트워크 오버헤드로 처리량이 급격히 감소하였다.
-
-### Solution
-
-#### - Streaming Fault Tolerance
-
-Spark Structured Streaming의 Checkpoint 기반 상태 영속화를 적용하였다.
-
-```python
-.option("checkpointLocation", "/tmp/fds-checkpoint")
-```
-
-노드 장애 발생 시 Window State 복구 및 Exactly-Once 수준의 스트리밍 상태 복원을 가능하게 했다.
-
-#### - Partition-Level Redis Optimization
-
-foreachPartition 패턴을 통해 Partition 단위 Redis Connection Reuse 구조를 적용하였다.
-
-이를 통해 Redis 네트워크 오버헤드를 최소화하고 처리량(Throughput)을 크게 향상시켰다.
+* Connection Optimization
+  -`foreachPartition` 패턴을 통해 Partition 단위로 Redis Connection을 풀링(Reuse)함으로써 네트워크 오버헤드를 최소화하고 초당 처리량(Throughput)을 극대화했습니다.
 
 ---
 
-# 🏗️ System Architecture
+## 🏗️ System Architecture
 <img width="1280" height="1734" alt="test drawio (3)" src="https://github.com/user-attachments/assets/dedc7275-d543-4c1d-8f66-905b9bf32431" />
 
 ---
 
-# ⚡ Performance Benchmark
+## ⚡ Performance Benchmark
 
-## Stress Test Environment
+실제 운영 환경과 동일한 부하 스트레스 상황을 모사하기 위해 데이터 생성기의 네트워크 대기를 전면 제거한 **최대 하중(No-Sleep Maximum Throughput)** 상태에서 측정한 레이턴시 프로파일링 결과입니다.
 
-- No-Sleep Maximum Throughput Mode
-- 1,000 Continuous Transactions
-- Microsecond Precision Profiling
-- `time.perf_counter()` 기반 측정
+- **Test Target:** 1,000 Continuous Transactions
+- **Profiling Tool:** Microsecond Precision (`time.perf_counter()`)
 
 | Pipeline Stage | Mean | p95 | p99 |
 |---|---:|---:|---:|
@@ -167,114 +131,65 @@ foreachPartition 패턴을 통해 Partition 단위 Redis Connection Reuse 구조
 
 ---
 
-# 🏁 Key Engineering Outcomes
+## 🏁 Key Engineering Outcomes
 
-## ✅ Financial SLA Compliance & Business Impact
-
+### ✅ Financial SLA Compliance & Business Impact
 결제 승인 과정에서 FDS 판정 지연이 50ms를 초과할 경우, PG(Payment Gateway)사와의 통신 타임아웃이 발생하거나 사용자의 결제 이탈률이 급증하는 치명적인 비즈니스 손실이 발생합니다.
+본 아키텍처는 최대 하중 상태에서도 **p99 기준 11.715ms의 안정적인 추론 성능**을 확보했습니다. 이는 결제 시스템의 병목을 제로(0) 수준으로 방어하면서도 고도화된 머신러닝 사기 탐지 방어막을 무중단으로 운영할 수 있음을 증명합니다.
 
-본 아키텍처는 람다 아키텍처 기반의 피처 스토어와 인메모리 큐를 활용한 디스크 I/O 격리를 통해, 최대 하중 상태에서도 **p99 기준 11.715ms의 안정적인 추론 성능**을 확보했습니다. 이는 **결제 시스템의 병목을 제로(0) 수준으로 방어하면서도, 고도화된 머신러닝 사기 탐지 방어막을 무중단으로 운영할 수 있음**을 증명합니다.
-
-## ✅ Complete I/O Decoupling
-
-Redis 기반 Online Feature Join과 비동기 Queue 적재 구조를 통해 PostgreSQL Disk Write 비용이 실시간 승인 레이턴시에 영향을 주지 않도록 설계하였다.
-
-## ✅ ML Serving Bottleneck Identification
-
-프로파일링 결과 전체 레이턴시의 약 87%가 ML Inference 단계에서 발생함을 확인하였다.
-
-## Future Optimization Directions
-- LightGBM Migration
-- ONNX Runtime Acceleration
-- Native C++ Inference Serving
+### ✅ ML Serving Bottleneck Identification
+프로파일링 결과 전체 레이턴시의 약 87%가 인프라 I/O가 아닌 ML Inference 단계에서 발생함을 식별했습니다. 이를 통해 향후 시스템 고도화의 타겟이 네트워크가 아닌 **ML 모델 최적화(LightGBM 전환 또는 ONNX Runtime 가속)**에 있음을 데이터 기반으로 도출했습니다.
 
 ---
 
-# 📊 Real-Time Monitoring Dashboard
+## 📊 Real-Time Monitoring Dashboard
+
+텍스트 로그의 한계를 벗어나 관제 센터 환경의 시각화 모니터링 생태계를 입증하기 위해 SQLAlchemy Connection Pooling 기반 고속 대시보드를 구축했습니다.
 
 <img width="1757" height="797" alt="image" src="https://github.com/user-attachments/assets/013d724c-b959-4df4-ac03-eb52fc1294db" />
 
-### Real-Time Metrics
-- Total Transactions
-- Approved / Blocked Counts
-- Fraud Detection Rate
-- Real-Time Throughput
-  
-### Dynamic Visualization
-- Fraud Ratio Pie Chart
-- High-Risk Merchant Analysis
-- Live Detection Trend Graph
-
-### Fraud Monitoring Console
-실시간 차단된 거래에 대해 다음 정보를 추적 가능하다.
-
-- Transaction ID
-- User ID
-- Device ID
-- Merchant Category
-- Fraud Probability Score
+- **Real-Time Metrics:** 최근 500건 기준 총 트랜잭션, 승인/차단 건수, 실시간 탐지율 연산
+- **Dynamic Visualization:** Plotly 차트를 활용한 1초 주기 실시간 승인 분율 및 고위험 가맹점 분류 렌더링
+- **Fraud Monitoring Console:** 사기 판정된 유저의 ID, 금액, 기기 정보, ML 사기 확률(%) 실시간 추적 테이블
 
 ---
 
-# 🗂️ Project Structure
+## 🗂️ Project Structure
 
 ```text
 ├── docker/
-│   └── docker-compose.yml
-
+│   └── docker-compose.yml       # 인프라 컴포넌트 컨테이너 명세
 ├── data-generator/
-│   └── generator.py
-
+│   └── generator.py             # 하중 모드 및 사기 공격 시나리오 트랜잭션 생성기
 ├── streaming/
-│   └── spark_processor.py
-
+│   └── spark_processor.py       # Checkpoint 기반 Spark 분산 윈도우 스트리밍 엔진
 ├── batch/
-│   ├── fds_batch_job.py
+│   ├── fds_batch_job.py         # 커서 기반 대용량 멱등성 배치 가공 잡
 │   └── airflow_dags/
-│       └── fds_dag.py
-
+│       └── fds_dag.py           # execution_date 매핑형 Airflow DAG 
 ├── model/
-│   ├── train.py
-│   ├── inference.py
-│   ├── benchmark.py
-│   └── fds_model.pkl
-
-├── dashboard/
-│   └── app.py
+│   ├── train.py                 # 스키마 동기화 및 람다 피처 ML 학습 스크립트
+│   ├── inference.py             # Producer-Consumer 큐 기반 비동기 적재 인라인 추론 엔진
+│   ├── benchmark.py             # 마이크로초 정밀 성능 측정 프로파일러
+│   └── fds_model.pkl            
+└── dashboard/
+    └── app.py                   # 실시간 FDS 관제 대시보드 웹 앱
 ```
 
 ---
 
-# 🛠️ Technology Stack
+## 🛠️ Technology Stack
 
-### Data Streaming
-- Apache Kafka
-- Spark Structured Streaming
-
-### Storage
-- PostgreSQL
-- Redis
-
-### ML & Data Processing
-- Python
-- scikit-learn
-- Pandas
-- NumPy
-
-### Orchestration
-- Apache Airflow
-
-### Infrastructure
-- Docker
-- Docker Compose
-
-### Monitoring
-- Streamlit
-- Plotly
-
+- Data Streaming: Apache Kafka, Spark Structured Streaming
+- Storage: PostgreSQL (Data Lake), Redis (Online Feature Store)
+- ML & Data Processing: Python, scikit-learn, Pandas
+- Orchestration: Apache Airflow
+- Infrastructure: Docker, Docker Compose
+- Monitoring: Streamlit, Plotly
+- 
 ---
 
-# ▶️ Quick Start
+## ▶️ Quick Start
 
 본 프로젝트는 분산 환경 모사를 위해 컨테이너 기반으로 작성되었으며, 원활한 파이프라인 구동을 위해 다음 환경을 권장합니다.
 
@@ -288,21 +203,26 @@ Redis 기반 Online Feature Join과 비동기 Queue 적재 구조를 통해 Post
 
 ### 1. Start Infrastructure
 ```bash
+# 컨테이너 인프라 기동
 cd docker
 docker compose up -d
+cd ..
+
+# 파이썬 의존성 패키지 설치
+pip install -r requirements.txt
 ```
 
-### 2. Train Initial Model
+### 2. Train Initial ML Model (Cold-Start Prevention)
 ```bash
 python model/train.py
 ```
 
-### 3. Start Streaming Pipeline
+### 3. Start Spark Streaming Pipeline
 ```bash
 python streaming/spark_processor.py
 ```
 
-### 4. Execute Batch Aggregation
+### 4. Execute Batch Aggregation (Sync Baseline Features)
 ```bash
 python batch/fds_batch_job.py
 ```
@@ -312,12 +232,12 @@ python batch/fds_batch_job.py
 python model/inference.py
 ```
 
-### 6. Run Generator & Dashboard
+### 6. Run Generator & Dashboard (Observability)
 ```bash
-# Terminal A
+# Terminal A: 트랜잭션 스트레스 주입 시작
 python data-generator/generator.py
 
-# Terminal B
+# Terminal B: 실시간 시각화 브라우저 렌더링
 streamlit run dashboard/app.py
 ```
 
@@ -337,7 +257,7 @@ streamlit run dashboard/app.py
 
 ---
 
-# 🎯 Future Improvements
+## 🎯 Future Improvements
 - ONNX Runtime 기반 추론 가속
 - LightGBM 기반 고속 모델 전환
 - Kafka Multi-Broker Cluster 확장
