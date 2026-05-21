@@ -92,13 +92,13 @@ if __name__ == "__main__":
                     fraud_txs = generate_fraud_velocity()
                     for tx in fraud_txs:
                         producer.send(TOPIC_NAME, value=tx)
-                        print(f"🔥 [이상 거래 - 반복결제 발送] User: {tx['user_id']}, Amount: {tx['amount']}")
+                        print(f"🔥 [이상 거래 - 반복결제 발생] User: {tx['user_id']}, Amount: {tx['amount']}")
                         time.sleep(0.1)
                 elif fraud_type == "spike":
                     fraud_txs = generate_fraud_spike()
                     tx = fraud_txs[0]
                     producer.send(TOPIC_NAME, value=tx)
-                    print(f"🚨 [이상 거래 - 금액급증 발送] User: {tx['user_id']}, Amount: {tx['amount']}")
+                    print(f"🚨 [이상 거래 - 금액급증 발생] User: {tx['user_id']}, Amount: {tx['amount']}")
                     time.sleep(random.uniform(0.1, 0.5))
                     
     except KeyboardInterrupt:
