@@ -11,7 +11,7 @@ from kafka import KafkaConsumer
 redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 model = joblib.load('model/fds_model.pkl')
 
-# [Production Optimization] 비동기 쓰기 버퍼를 위한 인메모리 큐 아키텍처 도입
+# 비동기 쓰기 버퍼를 위한 인메모리 큐 아키텍처
 db_write_queue = queue.Queue(maxsize=10000)
 
 consumer = KafkaConsumer(
@@ -24,7 +24,7 @@ consumer = KafkaConsumer(
 )
 
 def db_worker_thread():
-    """[Data Engineering Pattern] 백그라운드에서 큐를 컨슘하여 DB 디스크에 비동기로 쓰기를 수행하는 독립 작업 레이어"""
+    """백그라운드에서 큐를 컨슘하여 DB 디스크에 비동기로 쓰기를 수행하는 독립 작업 레이어"""
     db_conn = psycopg2.connect(host="localhost", database="fds_db", user="fds_user", password="fds_password", port="5432")
     db_cursor = db_conn.cursor()
     
@@ -60,26 +60,45 @@ worker = threading.Thread(target=db_worker_thread, daemon=True)
 worker.start()
 
 def predict_lambda_fds(tx_data, streaming_features, batch_features):
+    """
+    [Lambda Architecture Inference Layer]
+    실시간 Raw + 스트리밍(10분) + 배치(30일) 피처를 다차원 결합하여 추론 수행.
+    """
     current_amount = tx_data['amount']
+    
+    # 1. 스트리밍 피처 추출
     tx_count_10m = int(streaming_features.get('tx_count_last_10m', 0))
     total_amount_10m = int(streaming_features.get('total_amount_last_10m', 0))
+    
+    # 2. 배치 피처 추출 (과거 이력이 아예 없는 신규 유저는 현재 금액을 기준으로 기본 셋팅)
     avg_amount_30d = int(batch_features.get('avg_amount_30d', current_amount))
     
+    # 3. 파생 피처 엔지니어링: 평소 30일 평균 결제액 대비 현재 요청 금액의 배율 연산
     spending_ratio_vs_30d = float(current_amount / avg_amount_30d) if avg_amount_30d > 0 else 1.0
+    
     is_high_risk_cat = 1 if tx_data.get('merchant_category') in ["game_money", "gift_card"] else 0
     is_hacker_dev = 1 if tx_data.get('device_id') == "dev_unknown_hacker" else 0
     
+    # [수정 지점] model/train.py의 fit 시점 컬럼 구성 및 순서와 100% 일치하도록 데이터프레임 생성
     input_df = pd.DataFrame([{
         'amount': current_amount,
         'tx_count_10m': tx_count_10m,
         'total_amount_10m': total_amount_10m,
+        'avg_amount_30d': avg_amount_30d,
+        'spending_ratio_vs_30d': spending_ratio_vs_30d,
         'is_high_risk_cat': is_high_risk_cat,
         'is_hacker_dev': is_hacker_dev
     }])
     
+    # 확실한 순서 보장을 위해 컬럼 배치 순서 재강제
+    feature_order = ['amount', 'tx_count_10m', 'total_amount_10m', 'avg_amount_30d', 'spending_ratio_vs_30d', 'is_high_risk_cat', 'is_hacker_dev']
+    input_df = input_df[feature_order]
+    
+    # 모델 확률 추론
     fraud_probability = model.predict_proba(input_df)[0][1]
     fraud_score = int(fraud_probability * 100)
     
+    # [하이브리드 룰 보완] 평소 쓰던 금액보다 10배 이상 과소비하면 강제 차단선 가중치 부여
     if spending_ratio_vs_30d >= 10.0 and current_amount >= 100000:
         fraud_score = max(fraud_score, 85)
         
@@ -94,17 +113,18 @@ if __name__ == "__main__":
             tx_data = message.value
             user_id = tx_data['user_id']
             
+            # Feature Store 온라인 조인 1: 실시간 스트리밍 피처 읽기
             stream_key = f"fds:user:{user_id}"
             streaming_features = redis_client.hgetall(stream_key)
             
+            # Feature Store 온라인 조인 2: 장기 배치 피처 읽기
             batch_key = f"fds:user:{user_id}:batch"
             batch_features = redis_client.hgetall(batch_key)
             
+            # 다차원 피처 결합 기반 스코어링
             fraud_score, avg_30d = predict_lambda_fds(tx_data, streaming_features, batch_features)
             decision = "BLOCKED" if fraud_score >= 70 else "APPROVED"
             
-            # [핵심 변경지점] 디스크 쓰기 병목을 막기 위해 동기 쿼리를 날리지 않고, 
-            # 메모리 큐에 데이터를 인큐잉한 뒤 즉각 다음 메시지를 컨슘하러 루프 이동
             tx_count_10m = int(streaming_features.get('tx_count_last_10m', 0))
             total_amount_10m = int(streaming_features.get('total_amount_last_10m', 0))
             db_write_queue.put((tx_data, fraud_score, decision, tx_count_10m, total_amount_10m))
@@ -118,5 +138,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n🛑 FDS 서비스를 안전하게 셧다운합니다.")
     finally:
-        db_write_queue.put(None) # 작업 스레드 종료 시그널 전달
+        db_write_queue.put(None)  # 작업 스레드 종료 시그널 전달
         worker.join()
