@@ -103,6 +103,8 @@ WHERE transaction_date < {{ ds }}
 
 이를 통해 언제 재실행하더라도 동일한 결과를 보장하는 완전한 멱등성을 확보하였다.
 
+---
+
 ## 4. Fault-Tolerant Distributed Streaming
 
 ### Problem
@@ -133,30 +135,12 @@ foreachPartition 패턴을 통해 Partition 단위 Redis Connection Reuse 구조
 
 이를 통해 Redis 네트워크 오버헤드를 최소화하고 처리량(Throughput)을 크게 향상시켰다.
 
-# 🏗️ System Architecture
+---
 
-```text
-[ Transaction Generator ]
-        │
-        ▼
-[ Apache Kafka ]
-        │
-        ├──────────────────────────────┐
-        ▼                              ▼
-[ Spark Structured Streaming ]   [ ML Inference Engine ]
-        │                              │
-        │                              ├─ Redis Online Feature Join
-        │                              ├─ ML Probability Inference
-        │                              ├─ Fraud Threshold Decision
-        ▼                              │
-[ Redis Feature Store ] <──────────────┘
-        ▲
-        │
-[ Airflow Batch Layer ]
-        │
-        ▼
-[ PostgreSQL Data Lake ]
-```
+# 🏗️ System Architecture
+<img width="1280" height="1734" alt="test drawio (3)" src="https://github.com/user-attachments/assets/dedc7275-d543-4c1d-8f66-905b9bf32431" />
+
+---
 
 # ⚡ Performance Benchmark
 
@@ -173,33 +157,42 @@ foreachPartition 패턴을 통해 Partition 단위 Redis Connection Reuse 구조
 | Redis Feature Retrieval | 0.793 ms | 1.136 ms | - |
 | ML Inference | 5.519 ms | 7.702 ms | - |
 
+<details>
+<summary>Benchmark Result Image</summary>
+
+![System Architecture](https://github.com/user-attachments/assets/46675ea8-9f57-4ab7-856b-03583caa7d10)
+
+</details>
+
+
 ---
 
 # 🏁 Key Engineering Outcomes
 
-## ✅ Financial SLA Compliance
+## ✅ Financial SLA Compliance & Business Impact
 
-p99 기준 11.715ms의 안정적인 추론 성능을 확보하여 금융권 실시간 승인 시스템의 일반적인 SLA 기준인 50ms 이하를 안정적으로 만족하였다.
+결제 승인 과정에서 FDS 판정 지연이 50ms를 초과할 경우, PG(Payment Gateway)사와의 통신 타임아웃이 발생하거나 사용자의 결제 이탈률이 급증하는 치명적인 비즈니스 손실이 발생합니다.
 
----
+본 아키텍처는 람다 아키텍처 기반의 피처 스토어와 인메모리 큐를 활용한 디스크 I/O 격리를 통해, 최대 하중 상태에서도 **p99 기준 11.715ms의 안정적인 추론 성능**을 확보했습니다. 이는 **결제 시스템의 병목을 제로(0) 수준으로 방어하면서도, 고도화된 머신러닝 사기 탐지 방어막을 무중단으로 운영할 수 있음**을 증명합니다.
 
 ## ✅ Complete I/O Decoupling
 
 Redis 기반 Online Feature Join과 비동기 Queue 적재 구조를 통해 PostgreSQL Disk Write 비용이 실시간 승인 레이턴시에 영향을 주지 않도록 설계하였다.
 
----
-
 ## ✅ ML Serving Bottleneck Identification
 
 프로파일링 결과 전체 레이턴시의 약 87%가 ML Inference 단계에서 발생함을 확인하였다.
 
-### Future Optimization Directions
-
+## Future Optimization Directions
 - LightGBM Migration
 - ONNX Runtime Acceleration
 - Native C++ Inference Serving
 
+---
+
 # 📊 Real-Time Monitoring Dashboard
+
+<img width="1757" height="797" alt="image" src="https://github.com/user-attachments/assets/013d724c-b959-4df4-ac03-eb52fc1294db" />
 
 ### Real-Time Metrics
 - Total Transactions
@@ -220,6 +213,8 @@ Redis 기반 Online Feature Join과 비동기 Queue 적재 구조를 통해 Post
 - Device ID
 - Merchant Category
 - Fraud Probability Score
+
+---
 
 # 🗂️ Project Structure
 
@@ -248,6 +243,8 @@ Redis 기반 Online Feature Join과 비동기 Queue 적재 구조를 통해 Post
 │   └── app.py
 ```
 
+---
+
 # 🛠️ Technology Stack
 
 ### Data Streaming
@@ -275,7 +272,19 @@ Redis 기반 Online Feature Join과 비동기 Queue 적재 구조를 통해 Post
 - Streamlit
 - Plotly
 
+---
+
 # ▶️ Quick Start
+
+본 프로젝트는 분산 환경 모사를 위해 컨테이너 기반으로 작성되었으며, 원활한 파이프라인 구동을 위해 다음 환경을 권장합니다.
+
+* **OS:** Ubuntu 22.04 LTS (WSL2 환경 테스트 완료)
+* **Compute Minimum Spec:** 4 Cores, 8GB RAM (Kafka & Spark 메모리 할당용)
+* **Engine & Runtime:**
+  * Python 3.11+
+  * Docker Engine 24.0+ & Docker Compose v2.0+
+* **Dependencies:** `requirements.txt` 참조
+---
 
 ### 1. Start Infrastructure
 ```bash
@@ -311,6 +320,22 @@ python data-generator/generator.py
 # Terminal B
 streamlit run dashboard/app.py
 ```
+
+---
+
+## 🔥 Troubleshooting & Lessons Learned
+
+개발 및 아키텍처 고도화 과정에서 마주친 치명적인 분산 시스템 문제들과 해결 과정입니다.
+
+### 1. Spark Streaming 노드 크래시 시 인메모리 윈도우 상태(State) 증발 문제
+* **Issue:** 로컬 인프라 하중 테스트 중 Spark 워커 노드가 OOM으로 크래시된 후 재시작되었을 때, 기존에 연산 중이던 10분 슬라이딩 윈도우의 카운트와 누적액 메모리가 전부 증발하여 탐지 정합성이 깨지는 현상을 발견했습니다.
+* **Action & Result:** Spark Structured Streaming의 결함 허용(Fault Tolerance)을 보장하기 위해 `.option("checkpointLocation", "...")` 레이어를 도입하여 HDFS/로컬 디스크에 메타데이터와 오프셋을 강제 영속화(Persist)했습니다. 이를 통해 노드가 언제 죽더라도 정확히 중단된 지점(Exactly-Once Semantics)부터 상태를 자가 복구하도록 파이프라인의 생존성을 확보했습니다.
+
+### 2. Lambda Architecture 환경에서의 ML Feature Schema Mismatch 에러
+* **Issue:** 실시간 스트리밍 피처(10분)와 배치 피처(30일)를 융합하여 추론 엔진에 주입하는 과정에서, 오프라인 모델 학습 시점의 Feature 차원(Dimension)과 실시간 온라인 Serving 시점의 데이터프레임 컬럼 순서가 미세하게 어긋나 런타임 에러(`ValueError: feature names mismatch`)가 발생했습니다.
+* **Action & Result:** 모델 서빙 레이어에서 입력 데이터프레임의 스키마 배열을 오프라인 `train.py`와 동일한 7-Dimensional Vector로 강제 정렬(`input_df = input_df[feature_order]`)하는 전처리 파이프라인을 구축했습니다. 이를 통해 람다 아키텍처 하에서 오프라인 환경과 온라인 환경의 피처 정합성(Feature Consistency)을 100% 동기화하는 데 성공했습니다.
+
+---
 
 # 🎯 Future Improvements
 - ONNX Runtime 기반 추론 가속
