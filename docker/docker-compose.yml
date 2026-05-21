@@ -1,7 +1,6 @@
 version: '3.8'
 
 services:
-  # 1. 메인 데이터 저장소 및 배치 분석용 PostgreSQL
   postgres:
     image: postgres:15-alpine
     container_name: fds-postgres
@@ -16,7 +15,6 @@ services:
     networks:
       - fds-network
 
-  # 2. 실시간 고속 피처 스토어 (Redis)
   redis:
     image: redis:7.0-alpine
     container_name: fds-redis
@@ -27,17 +25,17 @@ services:
     networks:
       - fds-network
 
-  # 3. Kafka 메타데이터 관리자 ZooKeeper
   zookeeper:
     image: confluentinc/cp-zookeeper:7.3.0
     container_name: fds-zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data  # 볼륨 추가
     networks:
       - fds-network
 
-  # 4. 실시간 메시지 큐 Kafka Broker
   kafka:
     image: confluentinc/cp-kafka:7.3.0
     container_name: fds-kafka
@@ -48,10 +46,11 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      # WSL2 호스트와 컨테이너 내부 모두에서 접근 가능하도록 리스너 설정
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka_data:/var/lib/kafka/data  # 볼륨 추가
     networks:
       - fds-network
 
@@ -62,3 +61,5 @@ networks:
 volumes:
   postgres_data:
   redis_data:
+  zookeeper_data:  # 볼륨 정의 추가
+  kafka_data:      # 볼륨 정의 추가
