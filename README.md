@@ -60,6 +60,7 @@
 * 실시간 추론 루프는 메모리 큐에 즉시 결과를 Enqueue한 뒤 다음 카프카 메시지를 처리하며, 별도의 백그라운드 워커가 비동기적으로 DB에 적재합니다.
 * 이를 통해 무거운 Disk I/O가 메인 추론 경로(Critical Path)에 미치는 영향을 0%로 통제하는 완전한 I/O Decoupling 구조를 완성했습니다.
 
+* **💡 Architecture Trade-off & Production Next Step:** 단일 노드 제약상 현재 In-Memory Queue를 사용하여 I/O 격리를 구현했으나, 인퍼런스 노드 장애 시 큐 데이터 유실(Data Loss) 리스크가 존재합니다. 실제 프로덕션 도입 시에는 이를 **Kafka Result Topic** 또는 **Redis Stream** 기반의 외부 비동기 큐로 분리하여 영속성(Durability)과 내결함성을 동시에 확보하는 구조로 확장할 수 있도록 설계했습니다.
 ---
 
 ## 3. OOM Prevention & Idempotent Batch Reprocessing
@@ -101,6 +102,8 @@
 * Connection Optimization
   -`foreachPartition` 패턴을 통해 Partition 단위로 Redis Connection을 풀링(Reuse)함으로써 네트워크 오버헤드를 최소화하고 초당 처리량(Throughput)을 극대화했습니다.
 
+* **Action & Result:** Spark Structured Streaming의 결함 허용(Fault Tolerance)을 보장하기 위해 `.option("checkpointLocation", "...")` 레이어를 도입하여 메타데이터와 오프셋을 강제 영속화했습니다. 노드 재시작 시 At-Least-Once로 재처리되지만, Sink 타겟인 **Redis의 `HSET` 연산이 멱등성(Idempotency)을 보장하므로 시스템 전체적으로는 상태 유실이나 중복 적재가 없는 Effectively-Once Semantics를 완벽하게 구현**했습니다.
+* 
 ---
 
 ## 🏗️ System Architecture
@@ -112,7 +115,7 @@
 
 실제 운영 환경과 동일한 부하 스트레스 상황을 모사하기 위해 데이터 생성기의 네트워크 대기를 전면 제거한 **최대 하중(No-Sleep Maximum Throughput)** 상태에서 측정한 레이턴시 프로파일링 결과입니다.
 
-- **Test Target:** 1,000 Continuous Transactions
+- **Test Target:** 1,000 Continuous Transactions **(대기 시간 없는 순간 스파이크 하중 모사 샘플링)**
 - **Profiling Tool:** Microsecond Precision (`time.perf_counter()`)
 
 | Pipeline Stage | Mean | p95 | p99 |
@@ -181,7 +184,7 @@
 ## 🛠️ Technology Stack
 
 - Data Streaming: Apache Kafka, Spark Structured Streaming
-- Storage: PostgreSQL (Data Lake), Redis (Online Feature Store)
+- Storage: PostgreSQL (Operational Data Store, ODS), Redis (Online Feature Store)
 - ML & Data Processing: Python, scikit-learn, Pandas
 - Orchestration: Apache Airflow
 - Infrastructure: Docker, Docker Compose
