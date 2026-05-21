@@ -5,7 +5,6 @@ import uuid
 from datetime import datetime
 from kafka import KafkaProducer
 from faker import Faker
-
 fake = Faker()
 
 # Kafka 프로듀서 설정 (Docker로 띄운 로컬 카프카에 연결)
